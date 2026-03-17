@@ -51,10 +51,14 @@
 {{- end -}}
 {{- end -}}
 
-{{/* Force-sync Application name: short clustergroup name (VP names the Argo CD Application after the group, e.g. "resilient"). */}}
+{{/* Force-sync Application name: "<pattern name>-<clustergroup name>" (e.g. ramendr-techdemo-resilient). */}}
 {{- define "opp.forceSyncAppName" -}}
 {{- $explicit := .Values.argocdHealthMonitor.forceSyncAppName | default "" -}}
-{{- if $explicit }}{{ $explicit }}{{- else }}{{ include "opp.managedClusterGroupName" . }}{{- end -}}
+{{- if $explicit }}{{ $explicit }}{{- else -}}
+  {{- $patternName := .Values.argocdHealthMonitor.patternName | default (index (.Values.global | default dict) "pattern") | default "ramendr-starter-kit" -}}
+  {{- $cgName := include "opp.managedClusterGroupName" . -}}
+  {{- printf "%s-%s" $patternName $cgName -}}
+{{- end -}}
 {{- end -}}
 
 {{/* JSON array of force-sync resources: only the managed clustergroup namespace (single Namespace). */}}
