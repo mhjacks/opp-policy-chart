@@ -4,9 +4,9 @@
     kind: ManagedCluster
   register: managed_clusters_result
 
-- name: Set expected clusters (exclude local-cluster)
+- name: Set expected clusters (exclude local-cluster, sorted for deterministic order)
   set_fact:
-    expected_clusters: "{{ (managed_clusters_result.resources | default([]) | map(attribute='metadata.name') | reject('equalto', 'local-cluster') | list) }}"
+    expected_clusters: "{{ (managed_clusters_result.resources | default([]) | map(attribute='metadata.name') | reject('equalto', 'local-cluster') | list | sort) }}"
 
 - name: Set clusters_ready when we have enough clusters
   set_fact:

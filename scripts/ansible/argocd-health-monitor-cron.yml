@@ -1,22 +1,31 @@
 ---
 # ArgoCD health monitor - CronJob (runs every 15 min). Check and remediate wedged clusters.
-# Requires: kubernetes.core. Run: ansible-playbook -i localhost, -c local argocd-health-monitor-cron.yml
+# Requires: kubernetes.core. Run from Helm CronJob; env set by chart (MANAGED_CLUSTER_GROUP_*, FORCE_SYNC_*).
 - name: ArgoCD health monitoring (CronJob)
   hosts: localhost
   gather_facts: true
   vars:
     primary_cluster: "{{ lookup('env', 'PRIMARY_CLUSTER') | default('ocp-primary', true) }}"
     secondary_cluster: "{{ lookup('env', 'SECONDARY_CLUSTER') | default('ocp-secondary', true) }}"
+    managed_cluster_group_namespace: "{{ lookup('env', 'MANAGED_CLUSTER_GROUP_NAMESPACE') | default('', true) }}"
+    managed_cluster_group_name: "{{ lookup('env', 'MANAGED_CLUSTER_GROUP_NAME') | default('', true) }}"
+    cluster_argocd_namespace: "{{ managed_cluster_group_namespace }}"
+    cluster_argocd_instance: "{{ managed_cluster_group_name }}-gitops-server"
     force_sync_app_namespace: "{{ lookup('env', 'FORCE_SYNC_APP_NAMESPACE') | default('openshift-gitops', true) }}"
-    force_sync_app_name: "{{ lookup('env', 'FORCE_SYNC_APP_NAME') | default('ramendr-starter-kit-resilient', true) }}"
+    force_sync_app_name: "{{ lookup('env', 'FORCE_SYNC_APP_NAME') | default(managed_cluster_group_namespace, true) }}"
     force_sync_resource_kind: "{{ lookup('env', 'FORCE_SYNC_RESOURCE_KIND') | default('Namespace', true) }}"
-    force_sync_resource_name: "{{ lookup('env', 'FORCE_SYNC_RESOURCE_NAME') | default('ramendr-starter-kit-resilient', true) }}"
+    force_sync_resource_name: "{{ lookup('env', 'FORCE_SYNC_RESOURCE_NAME') | default(managed_cluster_group_namespace, true) }}"
     argocd_namespace: "openshift-gitops"
     max_attempts: 270
     sleep_interval: 20
-    cluster_argocd_namespace: "ramendr-starter-kit-resilient"
-    cluster_argocd_instance: "resilient-gitops-server"
   tasks:
+    - name: Require managed clustergroup env vars (set by Helm chart)
+      ansible.builtin.assert:
+        that:
+          - managed_cluster_group_namespace | length > 0
+          - managed_cluster_group_name | length > 0
+        fail_msg: "MANAGED_CLUSTER_GROUP_NAMESPACE and MANAGED_CLUSTER_GROUP_NAME must be set (by the chart or environment)."
+
     - name: Set hub kubeconfig
       set_fact:
         kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('', true) }}"
@@ -26,9 +35,9 @@
         kind: ManagedCluster
       register: managed_clusters_result
 
-    - name: Set expected clusters (exclude local-cluster)
+    - name: Set expected clusters (exclude local-cluster, sorted for deterministic order)
       set_fact:
-        expected_clusters: "{{ (managed_clusters_result.resources | default([]) | map(attribute='metadata.name') | reject('equalto', 'local-cluster') | list) }}"
+        expected_clusters: "{{ (managed_clusters_result.resources | default([]) | map(attribute='metadata.name') | reject('equalto', 'local-cluster') | list | sort) }}"
 
     - name: Fail when no managed clusters
       fail:
