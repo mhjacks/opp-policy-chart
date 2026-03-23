@@ -1,6 +1,7 @@
 ---
 # ODF SSL certificate extraction and distribution.
-# Requires: kubernetes.core. Env: KUBECONFIG (hub), PRIMARY_CLUSTER, SECONDARY_CLUSTER.
+# Requires: kubernetes.core. Env: PRIMARY_CLUSTER, SECONDARY_CLUSTER. Optional KUBECONFIG when not in-cluster.
+# Do not set empty KUBECONFIG on the play — it breaks hub API access in the Job pod (use SA token).
 # Run: ansible-playbook -i localhost, -c local odf-ssl-certificate-extraction.yml
 - name: ODF SSL certificate extraction
   hosts: localhost
@@ -10,16 +11,16 @@
     primary_cluster: "{{ lookup('env', 'PRIMARY_CLUSTER') | default('ocp-primary', true) }}"
     secondary_cluster: "{{ lookup('env', 'SECONDARY_CLUSTER') | default('ocp-secondary', true) }}"
     required_clusters: ["hub", "{{ primary_cluster }}", "{{ secondary_cluster }}"]
-    kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('', true) }}"
+    kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('', true) | trim }}"
   tasks:
     - name: Create work directory
-      file:
+      ansible.builtin.file:
         path: "{{ work_dir }}"
         state: directory
-        mode: '0755'
+        mode: "0755"
 
     - name: Extract hub CA (current context)
-      include_tasks: tasks/odf-ssl-extract-ca.yml
+      ansible.builtin.include_tasks: tasks/odf-ssl-extract-ca.yml
       vars:
         cluster_name: hub
         output_path: "{{ work_dir }}/hub-ca.crt"
@@ -27,31 +28,45 @@
 
     - name: Get ingress CA from hub (router-ca secret)
       block:
-        - kubernetes.core.k8s_info:
+        - name: Get hub ingress CA secret
+          kubernetes.core.k8s_info:
             kind: Secret
             name: router-ca
             namespace: openshift-ingress-operator
           register: router_ca
-        - copy:
+        - name: Write hub ingress CA certificate
+          ansible.builtin.copy:
             content: "{{ (router_ca.resources[0].data.get('tls.crt') or router_ca.resources[0].data.get('ca.crt', '')) | b64decode }}"
             dest: "{{ work_dir }}/hub-ingress-ca.crt"
-            mode: '0644'
+            mode: "0644"
           when: router_ca.resources | length > 0 and (router_ca.resources[0].data | length > 0)
       rescue:
-        - debug:
+        - name: Report missing hub ingress CA secret
+          ansible.builtin.debug:
             msg: "Hub ingress CA not available, continuing without it"
 
     - name: Get managed clusters
       kubernetes.core.k8s_info:
+        api_version: cluster.open-cluster-management.io/v1
         kind: ManagedCluster
       register: managed_clusters_result
 
     - name: Set managed clusters list (exclude local-cluster)
-      set_fact:
-        managed_clusters: "{{ (managed_clusters_result.resources | default([]) | map(attribute='metadata.name') | reject('equalto', 'local-cluster') | list) }}"
+      ansible.builtin.set_fact:
+        _mc_names: >-
+          {{
+            managed_clusters_result.resources | default([])
+            | map(attribute='metadata.name')
+            | reject('equalto', 'local-cluster')
+            | list
+          }}
+
+    - name: Merge hub discovery with PRIMARY_CLUSTER and SECONDARY_CLUSTER
+      ansible.builtin.set_fact:
+        managed_clusters: "{{ (_mc_names + [primary_cluster, secondary_cluster]) | unique | sort }}"
 
     - name: Download kubeconfig for managed cluster
-      include_tasks: tasks/kubeconfig.yml
+      ansible.builtin.include_tasks: tasks/kubeconfig-attempt.yml
       loop: "{{ managed_clusters }}"
       loop_control:
         label: "{{ item }}"
@@ -59,10 +74,9 @@
         cluster: "{{ item }}"
         kubeconfig_path: "{{ work_dir }}/{{ item }}-kubeconfig.yaml"
         check_available: false
-      ignore_errors: true
 
     - name: Extract CA from managed cluster
-      include_tasks: tasks/odf-ssl-extract-ca.yml
+      ansible.builtin.include_tasks: tasks/odf-ssl-extract-ca.yml
       loop: "{{ managed_clusters }}"
       loop_control:
         label: "{{ item }}"
@@ -71,11 +85,11 @@
         output_path: "{{ work_dir }}/{{ item }}-ca.crt"
         kubeconfig_path: "{{ work_dir }}/{{ item }}-kubeconfig.yaml"
       when: (work_dir + '/' + item + '-kubeconfig.yaml') is file
-      ignore_errors: true
 
     - name: Get ingress CA from managed cluster
       block:
-        - kubernetes.core.k8s_info:
+        - name: Get managed cluster ingress CA secret
+          kubernetes.core.k8s_info:
             kind: Secret
             name: router-ca
             namespace: openshift-ingress-operator
@@ -85,27 +99,36 @@
           when: (work_dir + '/' + item + '-kubeconfig.yaml') is file
           loop_control:
             label: "{{ item }}"
-          ignore_errors: true
-        - copy:
+          failed_when: false
+        - name: Write managed cluster ingress CA certificate
+          ansible.builtin.copy:
             content: "{{ (item.resources[0].data.get('tls.crt') or item.resources[0].data.get('ca.crt', '')) | b64decode }}"
             dest: "{{ work_dir }}/{{ item.item }}-ingress-ca.crt"
-            mode: '0644'
+            mode: "0644"
           loop: "{{ router_ca_mc.results | default([]) }}"
           when: item.resources | length > 0 and (item.resources[0].data | length > 0)
-      ignore_errors: true
-
+          failed_when: false
     - name: Find CA files in work dir
-      find:
+      ansible.builtin.find:
         paths: "{{ work_dir }}"
         patterns: "*.crt"
       register: ca_files_found
 
+    # Each path must be a separate shell word; join+quote made one bogus path and produced an empty bundle.
     - name: Create combined CA bundle (first 5 certs per file)
-      shell: |
+      ansible.builtin.shell: |
         set -e
         out="{{ work_dir }}/combined-ca-bundle.crt"
         : > "$out"
-        for f in {{ ca_files_found.files | map(attribute='path') | list | join(' ') | quote }}; do
+        for f in \
+        {% for p in ca_files_found.files %}
+        {% if loop.last %}
+        {{ p.path | quote }}
+        {% else %}
+        {{ p.path | quote }} \
+        {% endif %}
+        {% endfor %}
+        do
           [ -s "$f" ] || continue
           echo "# CA from $(basename "$f" .crt)" >> "$out"
           cert_count=0
@@ -119,11 +142,28 @@
       args:
         executable: /bin/bash
       when: ca_files_found.matched | default(0) > 0
+      changed_when: false
+
+    - name: Stat combined CA bundle
+      ansible.builtin.stat:
+        path: "{{ work_dir }}/combined-ca-bundle.crt"
+      register: combined_ca_stat
+      when: ca_files_found.matched | default(0) > 0
+
+    - name: Fail when combined CA bundle is empty or missing
+      ansible.builtin.fail:
+        msg: >-
+          combined-ca-bundle.crt is missing or too small ({{ combined_ca_stat.stat.size | default(0) }} bytes).
+          CA .crt files were found but the merge script produced no output — check paths and permissions.
+      when: >-
+        ca_files_found.matched | default(0) | int > 0
+        and (combined_ca_stat.stat.size | default(0) | int) < 64
 
     - name: Validate required clusters have CA
-      fail:
+      ansible.builtin.fail:
         msg: "CA material missing from required clusters (hub, {{ primary_cluster }}, {{ secondary_cluster }})."
-      when: (work_dir + '/hub-ca.crt') is not file or (work_dir + '/' + primary_cluster + '-ca.crt') is not file or (work_dir + '/' + secondary_cluster + '-ca.crt') is not file
+      when: (work_dir + '/hub-ca.crt') is not file or (work_dir + '/' + primary_cluster + '-ca.crt') is not file or (work_dir + '/' + secondary_cluster +
+        '-ca.crt') is not file
 
     - name: Get cluster-proxy-ca-bundle for merge
       kubernetes.core.k8s_info:
@@ -131,7 +171,7 @@
         name: cluster-proxy-ca-bundle
         namespace: openshift-config
       register: cluster_proxy_cm_get
-      ignore_errors: true
+      failed_when: false
 
     - name: Create cluster-proxy-ca-bundle ConfigMap
       kubernetes.core.k8s:
@@ -149,7 +189,6 @@
     - name: Patch cluster-proxy-ca-bundle ConfigMap
       kubernetes.core.k8s:
         state: present
-        merge: true
         definition:
           apiVersion: v1
           kind: ConfigMap
@@ -163,7 +202,6 @@
     - name: Update hub cluster proxy trustedCA
       kubernetes.core.k8s:
         state: present
-        merge: true
         definition:
           apiVersion: config.openshift.io/v1
           kind: Proxy
@@ -172,7 +210,7 @@
           spec:
             trustedCA:
               name: cluster-proxy-ca-bundle
-      ignore_errors: true
+      failed_when: false
 
     - name: Get ramenddr pods per cluster
       kubernetes.core.k8s_info:
@@ -186,19 +224,22 @@
       loop_control:
         label: "{{ item }}"
       when: (work_dir + '/' + item + '-kubeconfig.yaml') is file
-      ignore_errors: true
+      failed_when: false
 
     - name: Delete ramenddr-cluster-operator pods on managed clusters
-      include_tasks: tasks/odf-ssl-delete-pods.yml
+      ansible.builtin.include_tasks: tasks/odf-ssl-delete-pods.yml
       loop: "{{ ramen_pods_per_cluster.results | default([]) }}"
-      when: item.resources | default([]) | length > 0
+      loop_control:
+        loop_var: ramen_pod_query
+        label: "{{ ramen_pod_query.item }}"
+      when: ramen_pod_query.resources | default([]) | length > 0
       vars:
-        cluster: "{{ item.item }}"
-        pods: "{{ item.resources | default([]) }}"
-        namespace: openshift-dr-system
+        target_cluster: "{{ ramen_pod_query.item }}"
+        pods_to_delete: "{{ ramen_pod_query.resources | default([]) }}"
+        pod_namespace: openshift-dr-system
 
     - name: Encode combined CA bundle to base64
-      set_fact:
+      ansible.builtin.set_fact:
         ca_bundle_b64: "{{ lookup('file', work_dir + '/combined-ca-bundle.crt') | b64encode }}"
 
     - name: Get existing ramen-hub-operator-config
@@ -209,12 +250,16 @@
       register: ramen_config_cm
 
     - name: Update ramen-hub-operator-config with caCertificates in s3StoreProfiles
-      set_fact:
-        ramen_config_yaml: "{{ (ramen_config_cm.resources[0].data.get('ramen_manager_config.yaml') or '') if (ramen_config_cm.resources | length > 0) else '' }}"
+      ansible.builtin.set_fact:
+        ramen_config_yaml: >-
+          {{
+            (ramen_config_cm.resources[0].data.get('ramen_manager_config.yaml') or '')
+            if (ramen_config_cm.resources | length > 0) else ''
+          }}
       when: ramen_config_cm.resources | length > 0
 
     - name: Patch ramen config with caCertificates (create minimal if missing)
-      copy:
+      ansible.builtin.copy:
         content: |
           kubeObjectProtection:
             s3StoreProfiles:
@@ -228,13 +273,12 @@
           - s3ProfileName: {{ secondary_cluster }}
             caCertificates: "{{ ca_bundle_b64 }}"
         dest: "{{ work_dir }}/ramen_manager_config.yaml"
-        mode: '0644'
+        mode: "0644"
       when: ramen_config_yaml is not defined or ramen_config_yaml == ''
 
     - name: Apply ramen-hub-operator-config ConfigMap
       kubernetes.core.k8s:
         state: present
-        merge: "{{ ramen_config_cm.resources | length > 0 }}"
         definition:
           apiVersion: v1
           kind: ConfigMap
@@ -244,7 +288,7 @@
           data:
             ramen_manager_config.yaml: "{{ lookup('file', work_dir + '/ramen_manager_config.yaml') }}"
       when: (work_dir + '/ramen_manager_config.yaml') is file
-      ignore_errors: true
+      failed_when: false
 
     - name: Get Velero pods per cluster
       kubernetes.core.k8s_info:
@@ -258,16 +302,19 @@
       when: (work_dir + '/' + item + '-kubeconfig.yaml') is file
       loop_control:
         label: "{{ item }}"
-      ignore_errors: true
+      failed_when: false
 
     - name: Delete Velero pods on managed clusters
-      include_tasks: tasks/odf-ssl-delete-pods.yml
+      ansible.builtin.include_tasks: tasks/odf-ssl-delete-pods.yml
       loop: "{{ velero_pods_per_cluster.results | default([]) }}"
-      when: item.resources | default([]) | length > 0
+      loop_control:
+        loop_var: velero_pod_query
+        label: "{{ velero_pod_query.item }}"
+      when: velero_pod_query.resources | default([]) | length > 0
       vars:
-        cluster: "{{ item.item }}"
-        pods: "{{ item.resources | default([]) }}"
-        namespace: openshift-adp
+        target_cluster: "{{ velero_pod_query.item }}"
+        pods_to_delete: "{{ velero_pod_query.resources | default([]) }}"
+        pod_namespace: openshift-adp
 
     - name: Distribute CA bundle to managed cluster
       block:
@@ -287,11 +334,10 @@
           when: (work_dir + '/' + item + '-kubeconfig.yaml') is file
           loop_control:
             label: "{{ item }}"
-          ignore_errors: true
+          failed_when: false
         - name: Patch proxy on managed cluster
           kubernetes.core.k8s:
             state: present
-            merge: true
             definition:
               apiVersion: config.openshift.io/v1
               kind: Proxy
@@ -305,10 +351,8 @@
           when: (work_dir + '/' + item + '-kubeconfig.yaml') is file
           loop_control:
             label: "{{ item }}"
-          ignore_errors: true
+          failed_when: false
 
     - name: ODF SSL certificate extraction completed
-      debug:
+      ansible.builtin.debug:
         msg: "ODF SSL certificate management completed successfully."
-  environment:
-    KUBECONFIG: "{{ kubeconfig | default(omit) }}"

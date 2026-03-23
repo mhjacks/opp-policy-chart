@@ -19,11 +19,11 @@ spec:
         workingDir: /playbooks
         resources:
           requests:
-            memory: "512Mi"
+            memory: "768Mi"
             cpu: "200m"
           limits:
-            memory: "1Gi"
-            cpu: "500m"
+            memory: "1536Mi"
+            cpu: "1000m"
         env:
         - name: PRIMARY_CLUSTER
           value: {{ include "opp.primaryClusterName" . | quote }}
@@ -50,6 +50,8 @@ spec:
             path: odf-ssl-certificate-extraction.yml
           - key: tasks_kubeconfig.yml
             path: tasks/kubeconfig.yml
+          - key: tasks_kubeconfig_attempt.yml
+            path: tasks/kubeconfig-attempt.yml
           - key: tasks_odf_ssl_extract_ca.yml
             path: tasks/odf-ssl-extract-ca.yml
           - key: tasks_odf_ssl_delete_pods.yml
