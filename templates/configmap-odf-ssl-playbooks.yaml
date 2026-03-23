@@ -10,6 +10,8 @@ data:
 {{ .Files.Get "scripts/ansible/odf-ssl-certificate-extraction.yml" | indent 4 }}
   tasks_kubeconfig.yml: |
 {{ .Files.Get "scripts/ansible/tasks/kubeconfig.yml" | indent 4 }}
+  tasks_kubeconfig_attempt.yml: |
+{{ .Files.Get "scripts/ansible/tasks/kubeconfig-attempt.yml" | indent 4 }}
   tasks_odf_ssl_extract_ca.yml: |
 {{ .Files.Get "scripts/ansible/tasks/odf-ssl-extract-ca.yml" | indent 4 }}
   tasks_odf_ssl_delete_pods.yml: |
@@ -27,5 +29,5 @@ data:
 {{ .Files.Get "scripts/ansible/odf-ssl-precheck.yml" | indent 4 }}
   tasks_kubeconfig.yml: |
 {{ .Files.Get "scripts/ansible/tasks/kubeconfig.yml" | indent 4 }}
-  tasks_get_managed_clusters.yml: |
-{{ .Files.Get "scripts/ansible/tasks/get_managed_clusters.yml" | indent 4 }}
+  tasks_kubeconfig_attempt.yml: |
+{{ .Files.Get "scripts/ansible/tasks/kubeconfig-attempt.yml" | indent 4 }}

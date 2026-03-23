@@ -1,84 +1,104 @@
+---
 # One attempt: download kubeconfigs, check wedged, remediate, set all_healthy.
 # Vars: expected_clusters, attempt, max_attempts, sleep_interval, force_sync_*, cluster_argocd_*, argocd_namespace.
 - name: Reset wedged list for this attempt
-  set_fact:
+  ansible.builtin.set_fact:
     wedged_clusters: []
 
+- name: Reset kubeconfig failure list for this attempt
+  ansible.builtin.set_fact:
+    kubeconfig_failures: []
+
+# Include tasks/kubeconfig.yml only (already mounted). Avoids kubeconfig-attempt.yml, which is easy to omit from ConfigMap items.
 - name: Download kubeconfig for each cluster
-  include_tasks: kubeconfig.yml
+  ansible.builtin.include_tasks: tasks/kubeconfig.yml
   loop: "{{ expected_clusters }}"
   loop_control:
-    label: "{{ item }}"
+    loop_var: cluster_name
+    label: "{{ cluster_name }}"
   vars:
-    cluster: "{{ item }}"
-    kubeconfig_path: "/tmp/{{ item }}-kubeconfig.yaml"
+    cluster: "{{ cluster_name }}"
+    kubeconfig_path: "/tmp/{{ cluster_name }}-kubeconfig.yaml"
     check_available: false
-  register: kc_download
   ignore_errors: true
+  register: _kc_download_loop
 
-- name: Set kubeconfig failures from download results
-  set_fact:
-    kubeconfig_failures: "{{ (kc_download.results | default([]) | selectattr('failed', true) | map(attribute='item') | list) }}"
+- name: Record kubeconfig download failures
+  ansible.builtin.set_fact:
+    kubeconfig_failures: >-
+      {{
+        _kc_download_loop.results | default([])
+        | selectattr('failed', 'defined')
+        | selectattr('failed')
+        | map(attribute='cluster_name')
+        | list
+      }}
+  when: _kc_download_loop.results is defined
 
 - name: Fail on last attempt when kubeconfig failures
-  fail:
+  ansible.builtin.fail:
     msg: "Cannot access clusters after {{ max_attempts }} attempts: {{ kubeconfig_failures }}"
   when: kubeconfig_failures | default([]) | length > 0 and attempt | int >= max_attempts
 
 - name: Pause and retry when kubeconfig failures
-  pause:
+  ansible.builtin.pause:
     seconds: "{{ sleep_interval }}"
   when: kubeconfig_failures | default([]) | length > 0 and attempt | int < max_attempts
 
 - name: Check each cluster for wedged state
+  when: kubeconfig_failures | default([]) | length == 0
+
   block:
-    - name: Check nodes reachable on {{ item }}
+    - name: Check nodes reachable on {{ hc_cluster }}
       kubernetes.core.k8s_info:
         kind: Node
-        kubeconfig: "/tmp/{{ item }}-kubeconfig.yaml"
+        kubeconfig: "/tmp/{{ hc_cluster }}-kubeconfig.yaml"
       register: nodes_result
       loop: "{{ expected_clusters }}"
       loop_control:
-        label: "{{ item }}"
-      when: item not in (kubeconfig_failures | default([]))
-      ignore_errors: true
+        loop_var: hc_cluster
+        label: "{{ hc_cluster }}"
+      when: hc_cluster not in (kubeconfig_failures | default([]))
+      failed_when: false
 
     - name: Mark wedged when nodes unreachable
-      set_fact:
-        wedged_clusters: "{{ wedged_clusters | default([]) + [item.item] }}"
+      ansible.builtin.set_fact:
+        wedged_clusters: "{{ wedged_clusters | default([]) + [nr.hc_cluster] }}"
       loop: "{{ nodes_result.results | default([]) }}"
-      when: item is failed or (item.resources | default([]) | length == 0)
       loop_control:
-        label: "{{ item.item }}"
+        loop_var: nr
+        label: "{{ nr.hc_cluster }}"
+      when: nr is failed or (nr.resources | default([]) | length == 0)
 
-    - name: Check ArgoCD namespace and pods on {{ item }}
+    - name: Check ArgoCD namespace and pods on {{ hc_cluster }}
       kubernetes.core.k8s_info:
         kind: Pod
         namespace: "{{ cluster_argocd_namespace }}"
-        kubeconfig: "/tmp/{{ item }}-kubeconfig.yaml"
+        kubeconfig: "/tmp/{{ hc_cluster }}-kubeconfig.yaml"
         label_selectors:
           - "app.kubernetes.io/name={{ cluster_argocd_instance }}"
       register: argocd_pods_result
       loop: "{{ expected_clusters }}"
       loop_control:
-        label: "{{ item }}"
-      when: item not in (kubeconfig_failures | default([])) and item not in (wedged_clusters | default([]))
+        loop_var: hc_cluster
+        label: "{{ hc_cluster }}"
+      when: >-
+        hc_cluster not in (kubeconfig_failures | default([]))
+        and hc_cluster not in (wedged_clusters | default([]))
       vars:
-        cluster: "{{ item }}"
+        cluster: "{{ hc_cluster }}"
 
     - name: Mark wedged when gitops-server pod count != 1
-      set_fact:
-        wedged_clusters: "{{ wedged_clusters | default([]) + [item.item] }}"
+      ansible.builtin.set_fact:
+        wedged_clusters: "{{ wedged_clusters | default([]) + [apr.hc_cluster] }}"
       loop: "{{ argocd_pods_result.results | default([]) }}"
-      when: (item.resources | default([]) | length) != 1
       loop_control:
-        label: "{{ item.item }}"
-  when: kubeconfig_failures | default([]) | length == 0
-
+        loop_var: apr
+        label: "{{ apr.hc_cluster }}"
+      when: (apr.resources | default([]) | length) != 1
 - name: Remediate wedged clusters (force sync Application)
   kubernetes.core.k8s:
     state: present
-    merge: true
     definition:
       apiVersion: argoproj.io/v1alpha1
       kind: Application
@@ -92,23 +112,46 @@
               name: "{{ force_sync_resource_name }}"
           syncOptions:
             - "Force=true"
-    kubeconfig: "/tmp/{{ item }}-kubeconfig.yaml"
+    kubeconfig: "/tmp/{{ wedged_cluster }}-kubeconfig.yaml"
   loop: "{{ wedged_clusters | default([]) }}"
   loop_control:
-    label: "{{ item }}"
+    loop_var: wedged_cluster
+    label: "{{ wedged_cluster }}"
   when: wedged_clusters | default([]) | length > 0
-  ignore_errors: true
+  failed_when: false
 
 - name: Set all_healthy
-  set_fact:
-    all_healthy: "{{ (wedged_clusters | default([]) | length == 0) and (kubeconfig_failures | default([]) | length == 0) }}"
+  ansible.builtin.set_fact:
+    all_healthy: >-
+      {{
+        ((wedged_clusters | default([]) | length == 0)
+         and (kubeconfig_failures | default([]) | length == 0)) | bool
+      }}
 
-- name: Pause before next attempt when wedged
-  pause:
-    seconds: "{{ sleep_interval }}"
-  when: not all_healthy and (wedged_clusters | default([]) | length > 0)
+# Looped include_tasks can re-run despite all_healthy. end_play stops Job retries; Cron uses max_attempts=1.
+- name: All clusters healthy, stopping retry loop
+  ansible.builtin.debug:
+    msg: "Argo CD health OK (attempt {{ attempt }} of {{ max_attempts }})."
+  when:
+    - all_healthy | bool
+    - (max_attempts | int) > 1
+
+- name: Finish play when all clusters healthy (Job retry loop)
+  ansible.builtin.meta: end_play
+  when:
+    - all_healthy | bool
+    - (max_attempts | int) > 1
+
+- name: Pause before next health check attempt
+  ansible.builtin.pause:
+    seconds: "{{ sleep_interval | int }}"
+  when:
+    - (max_attempts | int) > 1
+    - (attempt | int) < (max_attempts | int)
+    - not (all_healthy | bool)
+    - (kubeconfig_failures | default([]) | length == 0)
 
 - name: Fail on last attempt when not all healthy
-  fail:
+  ansible.builtin.fail:
     msg: "Argo CD instances not healthy after {{ max_attempts }} attempts. Wedged: {{ wedged_clusters | default([]) }}."
   when: attempt | int >= max_attempts and not all_healthy

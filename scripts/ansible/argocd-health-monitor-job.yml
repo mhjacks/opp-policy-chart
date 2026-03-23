@@ -29,47 +29,64 @@
           - managed_cluster_group_name | length > 0
         fail_msg: "MANAGED_CLUSTER_GROUP_NAMESPACE and MANAGED_CLUSTER_GROUP_NAME must be set (by the chart or environment)."
 
-    - name: Set hub kubeconfig
-      set_fact:
-        kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('', true) }}"
+    # Trim only; do not export empty KUBECONFIG — that breaks in-cluster API auth (empty list of ManagedClusters).
+    - name: Set hub kubeconfig path when running outside cluster
+      ansible.builtin.set_fact:
+        kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('', true) | trim }}"
 
-    - name: Wait for managed clusters to appear
-      include_tasks: tasks/get_managed_clusters.yml
-      loop: "{{ range(1, 301) | list }}"
-      loop_control:
-        extended: yes
-        index_var: wait_idx
-        label: "{{ 'Wait ' + (wait_idx | string) }}"
-      vars:
-        sleep_interval: "{{ sleep_interval }}"
-        expected_cluster_count: "{{ expected_cluster_count }}"
-      when: not (clusters_ready | default(false))
-      register: wait_result
+    - name: Kubernetes API access (in-cluster SA when KUBECONFIG unset)
+      environment: "{{ {'KUBECONFIG': kubeconfig} if kubeconfig | length > 0 else {} }}"
+      block:
+        # Loop + include_tasks does not reliably persist clusters_ready between iterations, so the wait
+        # re-ran get_managed_clusters hundreds of times. Single until/retry on k8s_info avoids that.
+        - name: Minimum managed clusters required (MIN_MANAGED_CLUSTERS, default 1)
+          ansible.builtin.set_fact:
+            _wait_min_clusters: "{{ lookup('env', 'MIN_MANAGED_CLUSTERS') | default(1, true) | int }}"
 
-    - name: Fail when no managed clusters after waiting
-      fail:
-        msg: "No managed clusters found after waiting."
-      when: not (clusters_ready | default(false))
+        - name: Wait until enough ManagedCluster resources on hub (excl. local-cluster)
+          kubernetes.core.k8s_info:
+            api_version: cluster.open-cluster-management.io/v1
+            kind: ManagedCluster
+          register: managed_clusters_poll
+          until: >-
+            (managed_clusters_poll.resources | default([])
+            | map(attribute='metadata.name')
+            | reject('equalto', 'local-cluster')
+            | list
+            | length
+            | int) >= (_wait_min_clusters | int)
+          retries: 300
+          delay: "{{ sleep_interval | int }}"
 
-    - name: Run health check attempts until all healthy or max attempts
-      include_tasks: tasks/argocd-health-check-one-attempt.yml
-      loop: "{{ range(1, max_attempts + 1) | list }}"
-      loop_control:
-        extended: yes
-        index_var: attempt_idx
-        label: "{{ 'Attempt ' + (attempt_idx | string) + ' of ' + (max_attempts | string) }}"
-      vars:
-        attempt: "{{ attempt_idx }}"
-      when: not (all_healthy | default(false))
-      register: attempt_result
+        - name: Set expected cluster list for health checks
+          ansible.builtin.set_fact:
+            expected_clusters: >-
+              {{
+                managed_clusters_poll.resources
+                | default([])
+                | map(attribute='metadata.name')
+                | reject('equalto', 'local-cluster')
+                | list
+                | sort
+              }}
 
-    - name: Fail when not all clusters healthy after max attempts
-      fail:
-        msg: "ArgoCD health monitoring did not complete within {{ max_attempts }} attempts."
-      when: not (all_healthy | default(false))
+        - name: Run health check attempts until all healthy or max attempts
+          ansible.builtin.include_tasks: tasks/argocd-health-check-one-attempt.yml
+          loop: "{{ range(1, max_attempts + 1) | list }}"
+          loop_control:
+            extended: true
+            index_var: attempt_idx
+            label: "{{ 'Attempt ' + (attempt_idx | string) + ' of ' + (max_attempts | string) }}"
+          vars:
+            attempt: "{{ attempt_idx }}"
+          when: not (all_healthy | default(false) | bool)
+          register: attempt_result
 
-    - name: Success
-      debug:
-        msg: "All clusters are healthy - health monitoring completed successfully."
-  environment:
-    KUBECONFIG: "{{ kubeconfig | default(omit) }}"
+        - name: Fail when not all clusters healthy after max attempts
+          ansible.builtin.fail:
+            msg: "ArgoCD health monitoring did not complete within {{ max_attempts }} attempts."
+          when: not (all_healthy | default(false) | bool)
+
+        - name: Success
+          ansible.builtin.debug:
+            msg: "All clusters are healthy - health monitoring completed successfully."

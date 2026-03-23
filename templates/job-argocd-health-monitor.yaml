@@ -38,6 +38,13 @@ spec:
           value: Namespace
         - name: FORCE_SYNC_RESOURCE_NAME
           value: {{ include "opp.managedClusterGroupNamespace" . | quote }}
+        resources:
+          requests:
+            memory: "384Mi"
+            cpu: "100m"
+          limits:
+            memory: "768Mi"
+            cpu: "500m"
         command:
         - ansible-playbook
         args:
